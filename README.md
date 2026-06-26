@@ -190,6 +190,7 @@ No external libraries. No build step. Paste and run.
 ---
 
 ## 📸 Screenshots
+[Automated_Warehouse_Engine.pdf](https://github.com/user-attachments/files/29372652/Automated_Warehouse_Engine.pdf)
 
 > *See the portfolio presentation for visual walkthroughs of each feature.*
 
