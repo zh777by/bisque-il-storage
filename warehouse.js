@@ -12,6 +12,8 @@ const ST_ORDER_SHEET   = 'OUT';
 const ST_COLORS_SHEET  = 'PAINTS';
 
 const ST_SHELF_HEADER  = 'Shelf #';
+// Заголовок колонки BOXES PER MASTER CARTON
+const ST_BOXES_HEADER  = 'BOXES PER MASTER CARTON';
 // 'Item #' добавлен — новый заголовок артикула в листе OUT
 const ST_ORDER_SKU_HEADERS = ['Item #','מק״ט','מק\'\'ט','מק""ט','מק\'ט','מק"ט'];
 // Shelf# вставляется перед первой статусной колонкой
@@ -42,9 +44,12 @@ const TARGET_SHEETS_IN = ['POTTERY', 'PAINTS'];
 // Заголовки колонок листа IN (строка 1) — менять здесь при переименовании
 const IN_HEADER_ITEM           = 'Item #';          // артикул (SKU)
 const IN_HEADER_DESC           = 'Description';     // название товара
-const IN_HEADER_QTY            = 'Qty';             // количество
+const IN_HEADER_QTY            = 'Qty';             // необязательная; если есть — не переносится
 const IN_HEADER_STATUS_POTTERY = 'סטטוס pottery';   // статус для POTTERY: пусто = не переносить
 const IN_HEADER_STATUS_PAINTS  = 'סטטוס paints';    // статус для PAINTS:  пусто = не переносить
+
+// Разделитель, когда к существующей полке дописывается новая (A7 → "A7, C1")
+const IN_SHELF_SEPARATOR = ', ';
 
 
 /***********************************************************************
@@ -189,7 +194,7 @@ function st_normKey(v){ return (v === null || v === undefined) ? '' : String(v).
 
 function st_clean(s){
   return String(s || '')
-    .replace(/[\u200E\u200F\u202A-\u202E]/g, '')
+    .replace(/[‎‏‪-‮]/g, '')
     .replace(/[""„"]/g, '"')
     .replace(/[׳׳′""]/g, "''")
     .trim().toLowerCase();
@@ -251,6 +256,68 @@ function st_ensureThreeRowHeader(sheet){
   const r2Has = r2.some(v => v === 'total' || v === 'in' || v === 'out');
   const r3Has = r3.some(v => v === 'total' || v === 'in' || v === 'out');
   if (r2Has && !r3Has) sheet.insertRowAfter(1);
+}
+
+
+/***********************************************************************
+ * УТИЛИТЫ — Transfer IN (полки, заголовки)
+ ***********************************************************************/
+// Ключ заголовка: без RTL-символов, лишних пробелов/переносов строк, в нижнем регистре
+function _hdrKey(v){
+  return String(v === null || v === undefined ? '' : v)
+    .replace(/[‎‏‪-‮]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim().toLowerCase();
+}
+
+// Ключ SKU для сравнения
+function _skuKey(v){
+  return String(v === null || v === undefined ? '' : v).trim().toLowerCase();
+}
+
+function _isBlank(v){
+  return v === null || v === undefined || String(v).trim() === '';
+}
+
+// Поиск колонки по заголовку в строках 1..maxRow
+function _findColByHeaderInRows(sheet, header, maxRow){
+  const lastCol = sheet.getLastColumn();
+  if (!lastCol) return -1;
+  const rows = Math.min(maxRow, Math.max(1, sheet.getLastRow()));
+  const vals = sheet.getRange(1, 1, rows, lastCol).getDisplayValues();
+  const key = _hdrKey(header);
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < lastCol; c++) {
+      if (_hdrKey(vals[r][c]) === key) return c + 1;
+    }
+  }
+  return -1;
+}
+
+// "A7, B2" → ['A7','B2']
+function _splitShelves(v){
+  return String(v === null || v === undefined ? '' : v)
+    .split(/[,;\n]+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+// Для сравнения полок: A7 = a7 = A-7 = "A 7"
+function _shelfKey(s){
+  return String(s).replace(/[\s\-_.]/g, '').toUpperCase();
+}
+
+// Дописывает к existing полки из incoming, пропуская уже существующие.
+// Возвращает { value, added } — added = сколько полок реально добавлено.
+function _mergeShelves(existing, incoming){
+  const list = _splitShelves(existing);
+  const keys = new Set(list.map(_shelfKey));
+  let added = 0;
+  _splitShelves(incoming).forEach(s => {
+    const k = _shelfKey(s);
+    if (!keys.has(k)) { keys.add(k); list.push(s); added++; }
+  });
+  return { value: list.join(IN_SHELF_SEPARATOR), added };
 }
 
 
@@ -537,6 +604,21 @@ function _applyTargetChoice(sheetsToProcess, choice) {
 
 /***********************************************************************
  * ОСНОВНЫЕ ФУНКЦИИ — Transfer IN (из листа 'IN')
+ *
+ * Правила:
+ *  - Количество: из выбранной статусной колонки → в последний блок IN.
+ *  - Shelf # (если колонка есть в целевом листе):
+ *      1) TOTAL NOW = 0 (до переноса) → полка стирается (у всех строк).
+ *      2) SKU есть в IN и полка в IN не пустая:
+ *           • полка в листе пустая   → записывается полка из IN;
+ *           • полка в листе не пустая → полка из IN дописывается через ", "
+ *             (если такая полка уже есть — не дублируется).
+ *         Полка в IN пустая → ничего не меняется.
+ *  - Остальные колонки IN с таким же заголовком в целевом листе
+ *    (PCS PER BOX, BOXES PER MASTER CARTON и т.п.):
+ *      заменяются значением из IN, если оно не пустое; пусто → как было.
+ *  - Новые SKU → новая строка внизу списка, колонки заполняются
+ *    по совпадению заголовков с листом IN.
  ***********************************************************************/
 function transferFromInSheet_ST() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -548,24 +630,25 @@ function transferFromInSheet_ST() {
   const lastRowIn = shIn.getLastRow();
   if (lastRowIn < 2) { ss.toast('No data found on the IN sheet.'); return; }
 
-  // ── Находим колонки листа IN по заголовкам строки 1 ──────────────
-  const inLastCol          = shIn.getLastColumn();
-  const inHeaders          = shIn.getRange(1, 1, 1, inLastCol).getValues()[0];
-  const inColItem          = inHeaders.findIndex(h => String(h).trim().toLowerCase() === IN_HEADER_ITEM.toLowerCase());
-  const inColDesc          = inHeaders.findIndex(h => String(h).trim().toLowerCase() === IN_HEADER_DESC.toLowerCase());
-  const inColQty           = inHeaders.findIndex(h => String(h).trim().toLowerCase() === IN_HEADER_QTY.toLowerCase());
-  // ── ИЗМЕНЕНИЕ 1: ищем колонку Shelf # в листе IN ─────────────────
-  const inColShelf         = inHeaders.findIndex(h => String(h).trim() === ST_SHELF_HEADER);
-  // ─────────────────────────────────────────────────────────────────
-  const inColStatusPottery = inHeaders.findIndex(h => String(h).trim() === IN_HEADER_STATUS_POTTERY);
-  const inColStatusPaints  = inHeaders.findIndex(h => String(h).trim() === IN_HEADER_STATUS_PAINTS);
+  // ── Колонки листа IN по заголовкам строки 1 ──────────────────────
+  const inLastCol = shIn.getLastColumn();
+  const inHeaders = shIn.getRange(1, 1, 1, inLastCol).getValues()[0];
+  const inKeys    = inHeaders.map(_hdrKey);
+  const findIn    = h => inKeys.indexOf(_hdrKey(h));
 
-  // Обязательные колонки
-  if (inColItem < 0 || inColDesc < 0 || inColQty < 0) {
+  const inColItem          = findIn(IN_HEADER_ITEM);
+  const inColDesc          = findIn(IN_HEADER_DESC);
+  const inColQty           = findIn(IN_HEADER_QTY);
+  const inColShelf         = findIn(ST_SHELF_HEADER);
+  const inColStatusPottery = findIn(IN_HEADER_STATUS_POTTERY);
+  const inColStatusPaints  = findIn(IN_HEADER_STATUS_PAINTS);
+
+  // Обязательные колонки (Qty в листе IN больше не нужна —
+  // количество берётся из статусной колонки)
+  if (inColItem < 0 || inColDesc < 0) {
     const missing = [
       inColItem < 0 ? `"${IN_HEADER_ITEM}"` : null,
-      inColDesc < 0 ? `"${IN_HEADER_DESC}"` : null,
-      inColQty  < 0 ? `"${IN_HEADER_QTY}"` : null
+      inColDesc < 0 ? `"${IN_HEADER_DESC}"` : null
     ].filter(Boolean).join(', ');
     ui.alert(`Sheet "${IN_SHEET_NAME}": required headers ${missing} not found in row 1.`);
     return;
@@ -611,20 +694,50 @@ function transferFromInSheet_ST() {
     return;
   }
 
-  // ── Считываем данные IN, фильтруем по выбранной статусной колонке ─
+  // ── Дополнительные колонки IN (всё, кроме служебных и Shelf #) ────
+  // Например: PCS PER BOX, BOXES PER MASTER CARTON
+  const serviceCols = new Set(
+    [inColItem, inColDesc, inColQty, inColShelf, inColStatusPottery, inColStatusPaints].filter(i => i >= 0)
+  );
+  const inAttrCols = [];
+  inHeaders.forEach((h, i) => {
+    if (serviceCols.has(i) || _isBlank(h)) return;
+    inAttrCols.push({ idx: i, header: String(h).trim(), key: inKeys[i] });
+  });
+
+  // ── Считываем IN, фильтруем по выбранной статусной колонке ───────
   const inData = shIn.getRange(2, 1, lastRowIn - 1, inLastCol).getValues();
   const inMap  = new Map();
   inData.forEach(row => {
-    const sku    = String(row[inColItem]          || '').trim().toLowerCase();
-    const status = String(row[selectedStatusCol]  || '').trim();
-    if (!sku || !status) return;
-    // ── ИЗМЕНЕНИЕ 2: сохраняем значение shelf в inMap ────────────────
-    inMap.set(sku, {
-      name:  row[inColDesc],
-      qty:   row[inColQty],
-      shelf: inColShelf >= 0 ? row[inColShelf] : ''
+    const sku    = _skuKey(row[inColItem]);
+    const status = row[selectedStatusCol];
+    if (!sku || _isBlank(status)) return;
+
+    let entry = inMap.get(sku);
+    if (!entry) {
+      entry = {
+        sku:   String(row[inColItem]).trim(),  // оригинальное написание SKU
+        name:  row[inColDesc],
+        qty:   status,                         // количество берём из статусной колонки
+        shelf: '',
+        attrs: {}
+      };
+      inMap.set(sku, entry);
+    } else {
+      // SKU встречается повторно — суммируем количества
+      entry.qty = (Number(entry.qty) || 0) + (Number(status) || 0);
+      if (_isBlank(entry.name)) entry.name = row[inColDesc];
+    }
+
+    // Полки со всех повторов SKU собираются вместе (без дублей)
+    if (inColShelf >= 0 && !_isBlank(row[inColShelf])) {
+      entry.shelf = _mergeShelves(entry.shelf, row[inColShelf]).value;
+    }
+    // Остальные колонки: берётся последнее непустое значение
+    inAttrCols.forEach(a => {
+      const v = row[a.idx];
+      if (!_isBlank(v)) entry.attrs[a.key] = v;
     });
-    // ─────────────────────────────────────────────────────────────────
   });
 
   if (inMap.size === 0) {
@@ -644,77 +757,154 @@ function transferFromInSheet_ST() {
     return;
   }
 
-  // ── Выполняем перенос ─────────────────────────────────────────────
+  // ── Целевой лист ─────────────────────────────────────────────────
   const targetCol     = check.targetCol;
   const sheet         = ss.getSheetByName(targetSheetName);
   const lastCol       = sheet.getLastColumn();
   const lastRowTarget = sheet.getLastRow();
-  const numRows       = lastRowTarget - DATA_START_ROW + 1;
+  const numRows       = Math.max(0, lastRowTarget - DATA_START_ROW + 1);
+  const headerRows    = DATA_START_ROW - 1;
 
-  // ── ИЗМЕНЕНИЕ 3: ищем Shelf # только для POTTERY (в PAINTS её нет) ─
-  let shelfColTarget = -1;
-  if (targetSheetName === ST_STORAGE_SHEET && inColShelf >= 0) {
-    const shelfPos = st_findHeaderPosition(sheet, ST_SHELF_HEADER, ST_HEADER_SCAN_MAX_ROWS);
-    shelfColTarget = shelfPos.col; // останется -1, если колонки нет
-  }
-  // ─────────────────────────────────────────────────────────────────
+  // Shelf # в целевом листе (в PAINTS обычно нет → -1)
+  let shelfColTarget = _findColByHeaderInRows(sheet, ST_SHELF_HEADER, headerRows);
+  if (shelfColTarget <= 2 || shelfColTarget === targetCol) shelfColTarget = -1;
 
-  // SKU in column A (ITEM)
+  // Колонки целевого листа с такими же заголовками, как доп. колонки IN
+  const targetAttrCols = [];
+  inAttrCols.forEach(a => {
+    const col = _findColByHeaderInRows(sheet, a.header, headerRows);
+    if (col > 2 && col !== targetCol && col !== shelfColTarget) {
+      targetAttrCols.push({ key: a.key, col });
+    }
+  });
+
+  // SKU целевого листа (колонка A)
   const skuTargetVals = numRows > 0
     ? sheet.getRange(DATA_START_ROW, 1, numRows, 1).getValues()
     : [];
-  const existingSkus = new Set(skuTargetVals.map(r => String(r[0] || '').trim().toLowerCase()));
+  const targetKeys   = skuTargetVals.map(r => _skuKey(r[0]));
+  const existingSkus = new Set(targetKeys.filter(Boolean));
 
-  // ── ИЗМЕНЕНИЕ 4: обновляем существующие строки + пишем shelf ──────
-  let totalApplied = 0, totalNewRows = 0;
+  // TOTAL NOW — читаем ДО переноса
+  let totalNowVals = null;
   if (numRows > 0) {
-    const output      = [];
-    const shelfOutput = shelfColTarget > 0 ? [] : null;
+    try {
+      const totalNowCol = getTotalNowCol(sheet);
+      totalNowVals = sheet.getRange(DATA_START_ROW, totalNowCol, numRows, 1).getValues();
+    } catch (e) {
+      totalNowVals = null; // колонки TOTAL NOW нет — правило «0 → стереть полку» не применяется
+    }
+  }
+
+  let totalApplied = 0, totalNewRows = 0;
+  let shelvesCleared = 0, shelvesSet = 0, shelvesAppended = 0;
+
+  if (numRows > 0) {
+    // ── 1. Количество ──────────────────────────────────────────────
+    const output = [];
     for (let i = 0; i < numRows; i++) {
-      const sku  = String(skuTargetVals[i][0] || '').trim().toLowerCase();
-      const data = inMap.get(sku);
+      const data = inMap.get(targetKeys[i]);
       output.push([data ? data.qty : '']);
-      if (shelfOutput !== null) shelfOutput.push([data ? data.shelf : '']);
       if (data) totalApplied++;
     }
     sheet.getRange(DATA_START_ROW, targetCol, numRows, 1).setValues(output);
-    if (shelfOutput !== null && shelfColTarget > 0) {
-      sheet.getRange(DATA_START_ROW, shelfColTarget, numRows, 1).setValues(shelfOutput);
-    }
-  }
-  // ─────────────────────────────────────────────────────────────────
+    SpreadsheetApp.flush();
 
-  // ── ИЗМЕНЕНИЕ 5: новые строки — вставляем shelf в нужную колонку ──
-  const newRowsData = [];
-  inMap.forEach((data, sku) => {
-    if (!existingSkus.has(sku)) {
-      const newRow          = new Array(lastCol).fill('');
-      newRow[0]             = sku.toUpperCase(); // ITEM        (column A)
-      newRow[1]             = data.name;          // DESCRIPTION (column B)
-      newRow[targetCol - 1] = data.qty;
-      if (shelfColTarget > 0 && data.shelf !== '') {
-        newRow[shelfColTarget - 1] = data.shelf;
-      }
-      newRowsData.push(newRow);
-      totalApplied++; totalNewRows++;
+    // ── 2. Shelf # ─────────────────────────────────────────────────
+    if (shelfColTarget > 0) {
+      const shelfRange = sheet.getRange(DATA_START_ROW, shelfColTarget, numRows, 1);
+      const curShelf   = shelfRange.getValues();
+      let changed = false;
+
+      const shelfOut = curShelf.map((row, i) => {
+        let shelf = row[0];
+
+        // Правило 1: TOTAL NOW = 0 → стираем полку
+        if (totalNowVals) {
+          const tn = totalNowVals[i][0];
+          if (!_isBlank(tn) && Number(tn) === 0 && !_isBlank(shelf)) {
+            shelf = '';
+            shelvesCleared++;
+            changed = true;
+          }
+        }
+
+        // Правило 2: полка из IN
+        const data = inMap.get(targetKeys[i]);
+        if (data && data.shelf) {
+          if (_isBlank(shelf)) {
+            shelf = data.shelf;              // пусто → записываем
+            shelvesSet++;
+            changed = true;
+          } else {
+            const merged = _mergeShelves(shelf, data.shelf);
+            if (merged.added > 0) {          // не пусто → дописываем новые
+              shelf = merged.value;
+              shelvesAppended++;
+              changed = true;
+            }
+          }
+        }
+        return [shelf];
+      });
+
+      if (changed) shelfRange.setValues(shelfOut);
     }
+
+    // ── 3. PCS PER BOX, BOXES PER MASTER CARTON и др. ─────────────
+    //     Заменяем, только если в IN значение не пустое
+    targetAttrCols.forEach(t => {
+      const range = sheet.getRange(DATA_START_ROW, t.col, numRows, 1);
+      const cur   = range.getValues();
+      let changed = false;
+      const out = cur.map((row, i) => {
+        const data = inMap.get(targetKeys[i]);
+        if (data && Object.prototype.hasOwnProperty.call(data.attrs, t.key)) {
+          changed = true;
+          return [data.attrs[t.key]];
+        }
+        return row;
+      });
+      if (changed) range.setValues(out);
+    });
+  }
+
+  // ── 4. Новые позиции → вниз списка ───────────────────────────────
+  const newRowsData = [];
+  inMap.forEach((data, key) => {
+    if (existingSkus.has(key)) return;
+    const newRow          = new Array(lastCol).fill('');
+    newRow[0]             = data.sku;   // Item #      (колонка A)
+    newRow[1]             = data.name;  // Description (колонка B)
+    newRow[targetCol - 1] = data.qty;   // количество в блок IN
+    if (shelfColTarget > 0 && data.shelf) newRow[shelfColTarget - 1] = data.shelf;
+    targetAttrCols.forEach(t => {
+      if (Object.prototype.hasOwnProperty.call(data.attrs, t.key)) newRow[t.col - 1] = data.attrs[t.key];
+    });
+    newRowsData.push(newRow);
+    totalApplied++; totalNewRows++;
   });
-  // ─────────────────────────────────────────────────────────────────
 
   if (newRowsData.length > 0) {
     const startNewRow = sheet.getLastRow() + 1;
     sheet.getRange(startNewRow, 1, newRowsData.length, lastCol).setValues(newRowsData);
-    sheet.getRange(startNewRow - 1, 1, 1, lastCol).copyTo(
-      sheet.getRange(startNewRow, 1, newRowsData.length, lastCol),
-      SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false
-    );
+    // Формат копируем с последней строки данных (не с заголовка)
+    if (startNewRow - 1 >= DATA_START_ROW) {
+      sheet.getRange(startNewRow - 1, 1, 1, lastCol).copyTo(
+        sheet.getRange(startNewRow, 1, newRowsData.length, lastCol),
+        SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false
+      );
+    }
   }
 
   updateDayBlock(targetSheetName);
-  ss.toast(
-    `Transfer to ${targetSheetName} complete! ` +
-    `Updated: ${totalApplied - totalNewRows}, new rows added: ${totalNewRows}`
-  );
+
+  let msg = `Transfer to ${targetSheetName} complete! ` +
+            `Updated: ${totalApplied - totalNewRows}, new rows added: ${totalNewRows}`;
+  if (shelfColTarget > 0) {
+    msg += `. Shelf #: cleared ${shelvesCleared}, set ${shelvesSet}, appended ${shelvesAppended}`;
+  }
+  ss.toast(msg, 'Transfer IN', 8);
 }
 
 
@@ -944,10 +1134,16 @@ function transferToStorageLastBlock_ST() {
     const sku    = String(row[outColItem]         || '').trim().toLowerCase();
     const status = String(row[selectedStatusCol]  || '').trim();
     if (!sku || !status) return;
-    outMap.set(sku, {
-      name: row[outColDesc],
-      qty:  row[outColQty]
-    });
+    if (outMap.has(sku)) {
+      // SKU встречается повторно — суммируем количества
+      const existing = outMap.get(sku);
+      existing.qty = (Number(existing.qty) || 0) + (Number(status) || 0);
+    } else {
+      outMap.set(sku, {
+        name: row[outColDesc],
+        qty:  row[selectedStatusCol]    // количество берём из статусной колонки
+      });
+    }
   });
 
   if (outMap.size === 0) {
