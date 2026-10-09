@@ -51,6 +51,17 @@ const IN_HEADER_STATUS_PAINTS  = 'סטטוס paints';    // статус для 
 // Разделитель, когда к существующей полке дописывается новая (A7 → "A7, C1")
 const IN_SHELF_SEPARATOR = ', ';
 
+/***** НАСТРОЙКИ — Import Shopify (лист OUT) *****/
+// Колонки ищутся по заголовкам строки 1 (так надёжнее, если колонки сдвинутся)
+const SHOPIFY_HEADER_SKU    = 'Lineitem sku';
+const SHOPIFY_HEADER_NAME   = 'Lineitem name';
+const SHOPIFY_HEADER_QTY    = 'Lineitem quantity';
+const SHOPIFY_HEADER_PREFIX = 'lineitem';  // все колонки, чей заголовок начинается так, стираются
+// Если заголовков Shopify нет — используются буквы колонок
+const SHOPIFY_FALLBACK = { qty: 'J', name: 'K', sku: 'N', clearFrom: 'J', clearTo: 'N' };
+// Куда переносить в листе OUT
+const SHOPIFY_TARGET   = { sku: 'A', name: 'B', qty: 'C' };
+
 
 /***********************************************************************
  * УТИЛИТЫ — addNewDayBlock
@@ -615,8 +626,10 @@ function _applyTargetChoice(sheetsToProcess, choice) {
  *             (если такая полка уже есть — не дублируется).
  *         Полка в IN пустая → ничего не меняется.
  *  - Остальные колонки IN с таким же заголовком в целевом листе
- *    (PCS PER BOX, BOXES PER MASTER CARTON и т.п.):
- *      заменяются значением из IN, если оно не пустое; пусто → как было.
+ *    (PCS PER BOX, BOXES PER MASTER CARTON и т.п.) — для существующих SKU:
+ *      • в листе пусто, в IN есть значение → записывается из IN;
+ *      • в листе уже есть значение → НЕ меняется; если в IN другое
+ *        значение — SKU попадает в список расхождений (окно после переноса).
  *  - Новые SKU → новая строка внизу списка, колонки заполняются
  *    по совпадению заголовков с листом IN.
  ***********************************************************************/
@@ -774,7 +787,7 @@ function transferFromInSheet_ST() {
   inAttrCols.forEach(a => {
     const col = _findColByHeaderInRows(sheet, a.header, headerRows);
     if (col > 2 && col !== targetCol && col !== shelfColTarget) {
-      targetAttrCols.push({ key: a.key, col });
+      targetAttrCols.push({ key: a.key, col, header: a.header });
     }
   });
 
@@ -798,6 +811,8 @@ function transferFromInSheet_ST() {
 
   let totalApplied = 0, totalNewRows = 0;
   let shelvesCleared = 0, shelvesSet = 0, shelvesAppended = 0;
+  let attrsFilled = 0;
+  const attrMismatches = []; // строки для окна «расхождения»
 
   if (numRows > 0) {
     // ── 1. Количество ──────────────────────────────────────────────
@@ -852,16 +867,29 @@ function transferFromInSheet_ST() {
     }
 
     // ── 3. PCS PER BOX, BOXES PER MASTER CARTON и др. ─────────────
-    //     Заменяем, только если в IN значение не пустое
+    //     Существующие значения НЕ перезаписываются.
+    //     Пусто в листе → заполняем из IN.
+    //     Значение отличается → только сообщаем.
     targetAttrCols.forEach(t => {
       const range = sheet.getRange(DATA_START_ROW, t.col, numRows, 1);
       const cur   = range.getValues();
       let changed = false;
       const out = cur.map((row, i) => {
         const data = inMap.get(targetKeys[i]);
-        if (data && Object.prototype.hasOwnProperty.call(data.attrs, t.key)) {
+        if (!data || !Object.prototype.hasOwnProperty.call(data.attrs, t.key)) return row;
+
+        const inVal  = data.attrs[t.key];
+        const curVal = row[0];
+
+        if (_isBlank(curVal)) {
           changed = true;
-          return [data.attrs[t.key]];
+          attrsFilled++;
+          return [inVal];
+        }
+        if (String(curVal).trim() !== String(inVal).trim()) {
+          attrMismatches.push(
+            `${skuTargetVals[i][0]} — ${t.header}: в ${targetSheetName} ${curVal}, в IN ${inVal}`
+          );
         }
         return row;
       });
@@ -904,13 +932,133 @@ function transferFromInSheet_ST() {
   if (shelfColTarget > 0) {
     msg += `. Shelf #: cleared ${shelvesCleared}, set ${shelvesSet}, appended ${shelvesAppended}`;
   }
+  if (attrsFilled > 0) msg += `. Empty packaging cells filled: ${attrsFilled}`;
   ss.toast(msg, 'Transfer IN', 8);
+
+  // Расхождения упаковки: в листе ничего не менялось, только сообщаем
+  if (attrMismatches.length > 0) {
+    const MAX_LINES = 30;
+    const shown = attrMismatches.slice(0, MAX_LINES);
+    const more  = attrMismatches.length - shown.length;
+    ui.alert(
+      'Packaging mismatch — NOT changed',
+      `Значения в IN отличаются от ${targetSheetName}. ` +
+      `В ${targetSheetName} оставлены старые — если упаковка действительно изменилась, исправьте вручную.\n\n` +
+      shown.join('\n') +
+      (more > 0 ? `\n…и ещё ${more}` : ''),
+      ui.ButtonSet.OK
+    );
+  }
 }
 
 
 /***********************************************************************
  * ОСНОВНЫЕ ФУНКЦИИ — Shelf_Transfer (Transfer OUT)
  ***********************************************************************/
+/***********************************************************************
+ * Import Shopify — в листе OUT:
+ *   Lineitem sku (N)      → A (Item #)
+ *   Lineitem name (K)     → B (Description)
+ *   Lineitem quantity (J) → C (Qty)
+ *   затем колонки Lineitem (J–N) стираются вместе с заголовками.
+ ***********************************************************************/
+function _letterToColumn(letter) {
+  let col = 0;
+  const s = String(letter).toUpperCase().trim();
+  for (let i = 0; i < s.length; i++) col = col * 26 + (s.charCodeAt(i) - 64);
+  return col;
+}
+
+function importShopifyLinesToOut_ST() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+  const sh = ss.getSheetByName(ST_ORDER_SHEET);
+  if (!sh) { ui.alert(`Sheet "${ST_ORDER_SHEET}" not found.`); return; }
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) { ss.toast(`No data on sheet ${ST_ORDER_SHEET}.`); return; }
+
+  // ── Ищем колонки Shopify по заголовкам строки 1 ──────────────────
+  const keys = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(_hdrKey);
+  let colSku  = keys.indexOf(_hdrKey(SHOPIFY_HEADER_SKU))  + 1;
+  let colName = keys.indexOf(_hdrKey(SHOPIFY_HEADER_NAME)) + 1;
+  let colQty  = keys.indexOf(_hdrKey(SHOPIFY_HEADER_QTY))  + 1;
+  let clearCols;
+
+  if (colSku && colName && colQty) {
+    clearCols = keys
+      .map((k, i) => (k.startsWith(SHOPIFY_HEADER_PREFIX) ? i + 1 : 0))
+      .filter(Boolean);
+  } else {
+    // Заголовков нет — работаем по буквам J, K, N
+    colQty  = _letterToColumn(SHOPIFY_FALLBACK.qty);
+    colName = _letterToColumn(SHOPIFY_FALLBACK.name);
+    colSku  = _letterToColumn(SHOPIFY_FALLBACK.sku);
+    const from = _letterToColumn(SHOPIFY_FALLBACK.clearFrom);
+    const to   = _letterToColumn(SHOPIFY_FALLBACK.clearTo);
+    clearCols = [];
+    for (let c = from; c <= to; c++) clearCols.push(c);
+  }
+
+  // ── Считываем строки Shopify ─────────────────────────────────────
+  const width = Math.max(lastCol, colSku, colName, colQty);
+  const src = sh.getRange(2, 1, lastRow - 1, width).getValues();
+  const rows = [];
+  let noSku = 0;
+  src.forEach(r => {
+    const sku  = r[colSku - 1];
+    const name = r[colName - 1];
+    const qty  = r[colQty - 1];
+    if (_isBlank(sku) && _isBlank(name) && _isBlank(qty)) return; // пустая строка
+    if (_isBlank(sku)) noSku++;
+    rows.push({ sku, name, qty });
+  });
+
+  if (rows.length === 0) {
+    ui.alert(
+      'Nothing to import.\n' +
+      `No data found in columns "${SHOPIFY_HEADER_QTY}", "${SHOPIFY_HEADER_NAME}", "${SHOPIFY_HEADER_SKU}".`
+    );
+    return;
+  }
+
+  // ── Колонки A, B, C уже заполнены? → спрашиваем ──────────────────
+  const tSku  = _letterToColumn(SHOPIFY_TARGET.sku);
+  const tName = _letterToColumn(SHOPIFY_TARGET.name);
+  const tQty  = _letterToColumn(SHOPIFY_TARGET.qty);
+  const targetCols = [tSku, tName, tQty];
+
+  const hasOldData = targetCols.some(c =>
+    sh.getRange(2, c, lastRow - 1, 1).getValues().some(v => !_isBlank(v[0]))
+  );
+  if (hasOldData) {
+    const ans = ui.alert(
+      'Import Shopify',
+      `Columns ${SHOPIFY_TARGET.sku}, ${SHOPIFY_TARGET.name}, ${SHOPIFY_TARGET.qty} already contain data.\n` +
+      'Overwrite them?',
+      ui.ButtonSet.YES_NO
+    );
+    if (ans !== ui.Button.YES) { ss.toast('Import cancelled.'); return; }
+  }
+
+  // ── Очищаем A–C и записываем ─────────────────────────────────────
+  targetCols.forEach(c => sh.getRange(2, c, lastRow - 1, 1).clearContent());
+  sh.getRange(2, tSku,  rows.length, 1).setValues(rows.map(r => [r.sku]));
+  sh.getRange(2, tName, rows.length, 1).setValues(rows.map(r => [r.name]));
+  sh.getRange(2, tQty,  rows.length, 1).setValues(rows.map(r => [r.qty]));
+
+  // ── Стираем колонки Shopify вместе с заголовками ─────────────────
+  clearCols.forEach(c => sh.getRange(1, c, lastRow, 1).clearContent());
+
+  ss.toast(
+    `Imported ${rows.length} line(s) to ${ST_ORDER_SHEET}.` +
+    (noSku > 0 ? ` ⚠️ Without SKU: ${noSku} (they will not be transferred).` : ''),
+    'Import Shopify', 8
+  );
+}
+
+
 function updateOrderShelfByStorage_ST(){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const shStorage = ss.getSheetByName(ST_STORAGE_SHEET);
@@ -1211,10 +1359,70 @@ function transferToStorageLastBlock_ST() {
   }
 
   updateDayBlock(targetSheetName);
+  const shelvesCleared = clearShelvesForZeroStock(sheet);
   ss.toast(
     `Transfer to ${targetSheetName} complete! ` +
-    `Updated: ${totalApplied - totalNewRows}, new rows added: ${totalNewRows}`
+    `Updated: ${totalApplied - totalNewRows}, new rows added: ${totalNewRows}` +
+    (shelvesCleared > 0 ? `. Shelf # cleared (TOTAL NOW = 0): ${shelvesCleared}` : '')
   );
+}
+
+
+/***********************************************************************
+ * Shelf # — стирание полки, когда товар закончился (TOTAL NOW = 0)
+ *
+ * Вызывается автоматически:
+ *  - после Transfer OUT;
+ *  - после ручного ввода числа в колонку IN/OUT (только для изменённых строк);
+ *  - после «🔁 Update block» в A1;
+ *  - вручную из меню Transfer OUT → «Clear Shelf # where TOTAL NOW = 0».
+ * Работает только на листах, где есть колонка Shelf # (POTTERY).
+ *
+ * startRow / numRows — необязательно: если не заданы, проверяется весь лист.
+ * Возвращает количество стёртых полок.
+ ***********************************************************************/
+function clearShelvesForZeroStock(sheet, startRow, numRows) {
+  if (!sheet) return 0;
+  const lastRow = sheet.getLastRow();
+  if (lastRow < DATA_START_ROW) return 0;
+
+  const shelfCol = _findColByHeaderInRows(sheet, ST_SHELF_HEADER, DATA_START_ROW - 1);
+  if (shelfCol <= 2) return 0;              // на листе нет Shelf # (например, PAINTS)
+
+  let totalNowCol;
+  try { totalNowCol = getTotalNowCol(sheet); } catch (e) { return 0; }
+
+  const r0 = Math.max(startRow || DATA_START_ROW, DATA_START_ROW);
+  const r1 = numRows ? Math.min((startRow || DATA_START_ROW) + numRows - 1, lastRow) : lastRow;
+  if (r1 < r0) return 0;
+  const count = r1 - r0 + 1;
+
+  SpreadsheetApp.flush();                   // чтобы TOTAL NOW успел пересчитаться
+  const totals = sheet.getRange(r0, totalNowCol, count, 1).getValues();
+  const shelfRange = sheet.getRange(r0, shelfCol, count, 1);
+  const shelves = shelfRange.getValues();
+
+  let cleared = 0;
+  const out = shelves.map((row, i) => {
+    const tn = totals[i][0];
+    if (!_isBlank(tn) && Number(tn) === 0 && !_isBlank(row[0])) {
+      cleared++;
+      return [''];
+    }
+    return row;
+  });
+
+  if (cleared > 0) shelfRange.setValues(out);
+  return cleared;
+}
+
+// Пункт меню: проверить весь лист POTTERY
+function clearShelvesForZeroStockMenu() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(ST_STORAGE_SHEET);
+  if (!sheet) { SpreadsheetApp.getUi().alert(`Sheet "${ST_STORAGE_SHEET}" not found.`); return; }
+  const cleared = clearShelvesForZeroStock(sheet);
+  ss.toast(`${ST_STORAGE_SHEET}: Shelf # cleared where TOTAL NOW = 0: ${cleared}`, 'Shelf #', 5);
 }
 
 
@@ -1230,9 +1438,12 @@ function onOpen() {
     .addToUi();
 
   ui.createMenu('Transfer OUT')
+    .addItem('📋 Import Shopify lines (J–N → A–C)', 'importShopifyLinesToOut_ST')
     .addItem('Shelf #', 'updateOrderShelfByStorage_ST')
     .addItem('Sort by Shelf #', 'sortOrderByShelf_ST')
     .addItem('Transfer from OUT to POTTERY/PAINTS', 'transferToStorageLastBlock_ST')
+    .addSeparator()
+    .addItem('🧹 Clear Shelf # where TOTAL NOW = 0', 'clearShelvesForZeroStockMenu')
     .addToUi();
 
   VALID_SHEETS.forEach(name => {
@@ -1258,7 +1469,7 @@ function onEdit(e) {
     if (!val) return;
     if (val === "➕ IN")          addNewDayBlock("IN", sheetName);
     else if (val === "➕ OUT")    addNewDayBlock("OUT", sheetName);
-    else if (val === "🔁 Update block") updateDayBlock(sheetName);
+    else if (val === "🔁 Update block") { updateDayBlock(sheetName); clearShelvesForZeroStock(sheet); }
     else if (val === "🔤 Sort A→Z" && sheetName === 'POTTERY') sortByDescriptionPottery();
     sheet.getRange("A1").setValue("");
     return;
@@ -1269,6 +1480,15 @@ function onEdit(e) {
   if (row < DATA_START_ROW) return;
   const head = _norm(String(sheet.getRange(HDR_ROW_3, col).getValue() || ""));
   if (!head.startsWith("in") && !head.startsWith("out")) return;
+
+  _normalizeInOutCell(e);
+
+  // Товар закончился → стираем Shelf # в изменённых строках
+  try { clearShelvesForZeroStock(sheet, row, e.range.getNumRows()); } catch (err) {}
+}
+
+// Проверка/нормализация числа, введённого вручную в колонку IN/OUT
+function _normalizeInOutCell(e) {
   const hasFormula = !!e.range.getFormula();
   if (hasFormula) { e.range.setNumberFormat("0.############"); return; }
 
